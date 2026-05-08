@@ -21,4 +21,6 @@ jobs:
           username: ${{ secrets.OPS_DEPLOY_USER }}
           key: ${{ secrets.OPS_SSH_PRIVATE_KEY }}
           command_timeout: 30m
-          script: /opt/wworld/infrastructure/scripts/reindex-codegraph.sh 2>&1 | tee -a /var/log/codegraph-reindex.log
+          script: |
+            set -o pipefail
+            /opt/wworld/infrastructure/scripts/reindex-codegraph.sh 2>&1 | tee -a /var/log/codegraph-reindex.log
