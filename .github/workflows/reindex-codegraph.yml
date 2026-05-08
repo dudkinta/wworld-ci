@@ -1,0 +1,24 @@
+name: Reindex CodeGraph
+
+on:
+  repository_dispatch:
+    types: [reindex-codegraph]
+  workflow_dispatch:
+
+concurrency:
+  group: reindex-codegraph
+  cancel-in-progress: false
+
+jobs:
+  reindex:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Trigger reindex on Ops
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.OPS_DEPLOY_HOST }}
+          username: ${{ secrets.OPS_DEPLOY_USER }}
+          key: ${{ secrets.OPS_SSH_PRIVATE_KEY }}
+          command_timeout: 30m
+          script: /opt/wworld/infrastructure/scripts/reindex-codegraph.sh 2>&1 | tee -a /var/log/codegraph-reindex.log
