@@ -1,26 +1,104 @@
 name: Reindex CodeGraph
 
+# Триггерится тремя путями:
+# 1. repository_dispatch из сервисных репо (client_payload.service = имя сервиса)
+# 2. workflow_dispatch вручную (можно указать scope явно)
+# 3. schedule — ночной полный реиндекс (страховка от расхождений)
 on:
   repository_dispatch:
     types: [reindex-codegraph]
   workflow_dispatch:
+    inputs:
+      scope:
+        description: 'Что реиндексировать (имя сервиса или all)'
+        required: false
+        default: 'all'
+      no_embed:
+        description: 'Пропустить embeddings (фоновый воркер догонит)'
+        required: false
+        type: boolean
+        default: false
+  schedule:
+    # Каждую ночь в 03:17 UTC — полный реиндекс c embeddings.
+    - cron: '17 3 * * *'
 
 concurrency:
   group: reindex-codegraph
   cancel-in-progress: false
 
+permissions:
+  contents: read
+
 jobs:
   reindex:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Action только дёргает скрипт на Ops через SSH в режиме fire-and-forget
+    # и сразу выходит. Сама индексация идёт на Ops; статус — в /var/log/codegraph-reindex.log.
+    timeout-minutes: 3
     steps:
-      - name: Trigger reindex on Ops
+      - name: Resolve and validate scope
+        id: scope
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PAYLOAD_SERVICE: ${{ github.event.client_payload.service }}
+          INPUT_SCOPE: ${{ inputs.scope }}
+          INPUT_NO_EMBED: ${{ inputs.no_embed }}
+        run: |
+          set -euo pipefail
+          case "$EVENT_NAME" in
+            repository_dispatch)
+              SCOPE="${PAYLOAD_SERVICE:-all}"
+              NO_EMBED="1"          # из CI всегда без embed — догонит таймер
+              ;;
+            workflow_dispatch)
+              SCOPE="${INPUT_SCOPE:-all}"
+              if [ "$INPUT_NO_EMBED" = "true" ]; then NO_EMBED="1"; else NO_EMBED=""; fi
+              ;;
+            schedule)
+              SCOPE="all"
+              NO_EMBED=""           # nightly — с полным embed
+              ;;
+            *)
+              SCOPE="all"
+              NO_EMBED=""
+              ;;
+          esac
+          # Whitelist: иначе SCOPE подставляется в shell на Ops и даёт RCE
+          case "$SCOPE" in
+            all|auth-service|catalog-service|content-service|media-service|payment-service|subscription-service|admin-service|notification-service|frontend)
+              ;;
+            *)
+              echo "::error::Invalid scope '$SCOPE'. Allowed: all, <service>-service, frontend."
+              exit 1
+              ;;
+          esac
+          echo "scope=$SCOPE" >> "$GITHUB_OUTPUT"
+          echo "no_embed=$NO_EMBED" >> "$GITHUB_OUTPUT"
+          echo "Resolved scope='$SCOPE' no_embed='$NO_EMBED' (event=$EVENT_NAME)"
+
+      - name: Trigger reindex on Ops (fire-and-forget)
         uses: appleboy/ssh-action@v1
+        env:
+          REINDEX_SCOPE: ${{ steps.scope.outputs.scope }}
+          REINDEX_NO_EMBED: ${{ steps.scope.outputs.no_embed }}
         with:
           host: ${{ secrets.OPS_DEPLOY_HOST }}
           username: ${{ secrets.OPS_DEPLOY_USER }}
           key: ${{ secrets.OPS_SSH_PRIVATE_KEY }}
-          command_timeout: 30m
+          command_timeout: 1m
+          envs: REINDEX_SCOPE,REINDEX_NO_EMBED
           script: |
-            set -o pipefail
-            /opt/wworld/infrastructure/scripts/reindex-codegraph.sh 2>&1 | tee -a /var/log/codegraph-reindex.log
+            set -euo pipefail
+            # appleboy/ssh-action держит сессию пока открыт stdout/stderr дочерних
+            # процессов. Полностью отвязываем фон: setsid + nohup + редирект всех
+            # дескрипторов + disown -a. Иначе job висит до command_timeout.
+            mkdir -p /var/log
+            echo "[$(date '+%F %T')] dispatch scope='${REINDEX_SCOPE:-all}' no_embed='${REINDEX_NO_EMBED:-0}'" \
+              >> /var/log/codegraph-reindex.log
+            nohup setsid bash -c \
+              "REINDEX_SCOPE='${REINDEX_SCOPE:-all}' \
+               REINDEX_NO_EMBED='${REINDEX_NO_EMBED:-}' \
+               /opt/wworld/infrastructure/scripts/reindex-codegraph.sh" \
+              </dev/null >>/var/log/codegraph-reindex.log 2>&1 &
+            disown -a
+            echo "Reindex запущен в фоне; tail -f /var/log/codegraph-reindex.log"
