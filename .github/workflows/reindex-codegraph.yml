@@ -36,13 +36,13 @@ jobs:
     # и сразу выходит. Сама индексация идёт на Ops; статус — в /var/log/codegraph-reindex.log.
     timeout-minutes: 3
     steps:
-      - name: Resolve scope
+      - name: Resolve and validate scope
         id: scope
         env:
           EVENT_NAME: ${{ github.event_name }}
           PAYLOAD_SERVICE: ${{ github.event.client_payload.service }}
-          INPUT_SCOPE: ${{ github.event.inputs.scope }}
-          INPUT_NO_EMBED: ${{ github.event.inputs.no_embed }}
+          INPUT_SCOPE: ${{ inputs.scope }}
+          INPUT_NO_EMBED: ${{ inputs.no_embed }}
         run: |
           set -euo pipefail
           case "$EVENT_NAME" in
@@ -63,6 +63,15 @@ jobs:
               NO_EMBED=""
               ;;
           esac
+          # Whitelist: иначе SCOPE подставляется в shell на Ops и даёт RCE
+          case "$SCOPE" in
+            all|auth-service|catalog-service|content-service|media-service|payment-service|subscription-service|admin-service|notification-service|frontend)
+              ;;
+            *)
+              echo "::error::Invalid scope '$SCOPE'. Allowed: all, <service>-service, frontend."
+              exit 1
+              ;;
+          esac
           echo "scope=$SCOPE" >> "$GITHUB_OUTPUT"
           echo "no_embed=$NO_EMBED" >> "$GITHUB_OUTPUT"
           echo "Resolved scope='$SCOPE' no_embed='$NO_EMBED' (event=$EVENT_NAME)"
@@ -76,20 +85,20 @@ jobs:
           host: ${{ secrets.OPS_DEPLOY_HOST }}
           username: ${{ secrets.OPS_DEPLOY_USER }}
           key: ${{ secrets.OPS_SSH_PRIVATE_KEY }}
-          command_timeout: 2m
+          command_timeout: 1m
           envs: REINDEX_SCOPE,REINDEX_NO_EMBED
           script: |
-            set -o pipefail
-            # nohup + setsid + disown — отвязываем процесс от SSH-сессии,
-            # чтобы action не ждал окончания индексации.
-            mkdir -p /var/log /var/lib/codegraph
+            set -euo pipefail
+            # appleboy/ssh-action держит сессию пока открыт stdout/stderr дочерних
+            # процессов. Полностью отвязываем фон: setsid + nohup + редирект всех
+            # дескрипторов + disown -a. Иначе job висит до command_timeout.
+            mkdir -p /var/log
             echo "[$(date '+%F %T')] dispatch scope='${REINDEX_SCOPE:-all}' no_embed='${REINDEX_NO_EMBED:-0}'" \
               >> /var/log/codegraph-reindex.log
-            setsid nohup env \
-              REINDEX_SCOPE="${REINDEX_SCOPE:-all}" \
-              REINDEX_NO_EMBED="${REINDEX_NO_EMBED:-}" \
-              /opt/wworld/infrastructure/scripts/reindex-codegraph.sh \
-              >> /var/log/codegraph-reindex.log 2>&1 < /dev/null &
-            disown || true
-            sleep 1
+            nohup setsid bash -c \
+              "REINDEX_SCOPE='${REINDEX_SCOPE:-all}' \
+               REINDEX_NO_EMBED='${REINDEX_NO_EMBED:-}' \
+               /opt/wworld/infrastructure/scripts/reindex-codegraph.sh" \
+              </dev/null >>/var/log/codegraph-reindex.log 2>&1 &
+            disown -a
             echo "Reindex запущен в фоне; tail -f /var/log/codegraph-reindex.log"
